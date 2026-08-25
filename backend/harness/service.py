@@ -46,6 +46,9 @@ VISION_POLICIES_3D = (
     "vision-3d-predictive-skills", "vision-3d-direct-every-tick",
 )
 CONTROL_POLICIES = ("oracle-racing-line", "baseline-constant-intent", "baseline-random")
+DRAWING_REFERENCE = re.compile(
+    r"/(drawing-[a-z0-9][a-z0-9-]{2,63})\b", re.IGNORECASE,
+)
 
 
 def _is_explicit_circuit_request(prompt: str) -> bool:
@@ -152,10 +155,7 @@ class HarnessService:
         # The random id suffix is an address, not part of the natural-language
         # options. Strip the `use /...` command before count parsing so an id
         # ending in "49" cannot be mistaken for "49 ... laps".
-        options_prompt = re.sub(
-            rf"\buse\s+/{re.escape(drawing.id)}\b", "", prompt,
-            flags=re.IGNORECASE,
-        ).strip()
+        options_prompt = DRAWING_REFERENCE.sub("", prompt).strip()
         plan = parse_track_prompt(options_prompt or "asphalt circuit").model_copy(update={
             "title": drawing.name,
             "rationale": f"Centerline compiled from /{drawing.id}.",
@@ -845,12 +845,18 @@ class HarnessService:
         # a reply like "keep going?" reached a model with no idea what it was continuing.
         history = self._coordinator_history()
         self.store.save_agent_message(AgentMessage(id=f"msg-{uuid.uuid4().hex[:8]}", agent_role="main", speaker="user", content=prompt, created_at=timestamp()))
-        drawing_match = re.search(r"\buse\s+/([a-z0-9][a-z0-9-]{2,63})\b", prompt, re.IGNORECASE)
+        drawing_match = DRAWING_REFERENCE.search(prompt)
         drawing = self.store.get_drawing(drawing_match.group(1).lower()) if drawing_match else None
         if drawing_match and drawing is None:
-            raise KeyError(
-                f"Drawing /{drawing_match.group(1)} was not found. Open Draw and copy its saved reference."
+            message = (
+                f"I couldn't find saved drawing /{drawing_match.group(1)}. It may have been deleted "
+                "or the reference was mistyped. Open Draw and use its Use button to insert a valid reference."
             )
+            self.store.save_agent_message(AgentMessage(
+                id=f"msg-{uuid.uuid4().hex[:8]}", agent_role="main", speaker="assistant",
+                content=message, created_at=timestamp(), actions=self._failed_actions(actions),
+            ))
+            raise KeyError(message)
         assistant_message_id = f"msg-{uuid.uuid4().hex[:8]}"
         assistant_created_at = timestamp()
         # The coordinator's reply is the one part of this flow the user reads, so it
@@ -869,10 +875,18 @@ class HarnessService:
             "drawing_reference": f"/{drawing.id}" if drawing else None,
         }
         recorded: list[dict] = []
-        for kind, value in chat_agent_reply_stream(
+        if drawing:
+            drawing_reply = (
+                f"Using /{drawing.id} as the circuit centerline. I’ll smooth it, compile it, "
+                "and replay-certify the resulting track now."
+            )
+            chunks.append(drawing_reply)
+            emit({"type": "token", "text": drawing_reply})
+        reply_stream = () if drawing else chat_agent_reply_stream(
             role="main", message=prompt, history=history, tools=COORDINATOR_TOOLS,
-            environment_context=context,
-        ):
+            environment_context=context, dimensions=dimensions,
+        )
+        for kind, value in reply_stream:
             if kind == "text":
                 chunks.append(value)
                 emit({"type": "token", "text": value})
@@ -901,7 +915,9 @@ class HarnessService:
             # person gets an actual reply. Without the second leg a model that went straight
             # to the tool — which is exactly what it does when the whole message is feedback
             # — answered with silence.
-            chunks.extend(self._close_feedback_turn(prompt, history, recorded, context, emit))
+            chunks.extend(self._close_feedback_turn(
+                prompt, history, recorded, context, emit, dimensions=dimensions,
+            ))
         reply = "".join(chunks).strip()
 
         if not requested:
@@ -974,6 +990,14 @@ class HarnessService:
                 emit({"type": "log", "id": "environment", "stage": "rejected", "detail": str(error)[:300]})
         if environment is None:
             emit({"type": "step", "id": "environment", "label": "No certified circuit", "state": "failed"})
+            if drawing:
+                detail = errors[-1] if errors else "The drawing compiler returned no detail."
+                failure_reply = (
+                    f"I couldn't compile /{drawing.id} into a playable circuit: {detail} "
+                    "Try redrawing the congested portion with a wider turn or more space between nearby track sections."
+                )
+                emit({"type": "token", "text": "\n\n" + failure_reply})
+                reply = (reply + "\n\n" + failure_reply).strip()
             # Persisted before raising, or a failed dispatch leaves the user's question in the
             # transcript with no answer under it — which on reload looks exactly like the
             # conversation was thrown away.
@@ -1043,7 +1067,7 @@ class HarnessService:
 
     def _close_feedback_turn(
         self, prompt: str, history: list[dict], recorded: list[dict],
-        context: dict, emit: Callable[[dict], None],
+        context: dict, emit: Callable[[dict], None], *, dimensions: str = "2d",
     ) -> list[str]:
         """Second leg of the tool loop: hand back the results and stream the real reply."""
         assistant_blocks = [{
@@ -1066,7 +1090,7 @@ class HarnessService:
                 role="main", message=results, environment_context=context,
                 history=[*history, {"role": "user", "content": prompt},
                          {"role": "assistant", "content": assistant_blocks}],
-                tools=COORDINATOR_TOOLS,
+                tools=COORDINATOR_TOOLS, dimensions=dimensions,
             ):
                 if kind == "text":
                     chunks.append(value)

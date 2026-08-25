@@ -454,7 +454,12 @@ def compile_drawn_track(
     raw = _resample_closed(raw, min(128, max(48, len(raw))))
     last_findings: list[str] = []
     for smoothing_rounds in range(2, 7):
-        smoothed = raw
+        # Chaikin removes pointer noise but keeps the radius of a hand-drawn
+        # right angle close to its original, tiny sampling interval. Relax the
+        # low-resolution loop first, then round it: ordinary rectangles and
+        # diamonds become driveable sweeping turns without joining separate arms
+        # of a genuinely crossed or cramped drawing.
+        smoothed = _relax_drawn_curve(raw, smoothing_rounds * 6)
         for _ in range(smoothing_rounds):
             smoothed = _chaikin_closed(smoothed)
         fitted = _fit_drawn_points(smoothed, bounds, width, car_radius)
@@ -554,6 +559,31 @@ def _chaikin_closed(points: list[Vec2]) -> list[Vec2]:
             Vec2(x=.25 * point.x + .75 * following.x, y=.25 * point.y + .75 * following.y),
         ))
     return smoothed
+
+
+def _relax_drawn_curve(points: list[Vec2], rounds: int) -> list[Vec2]:
+    """Open freehand corners before high-resolution interpolation.
+
+    Applying this to the normalized, low-resolution stroke keeps the smoothing
+    scale tied to the visible drawing rather than to browser pointer frequency.
+    A short cyclic diffusion pass rounds sharp corners but retains the circuit's
+    overall topology; normal geometry validation still rejects crossings and
+    road corridors that would overlap.
+    """
+    relaxed = points
+    for _ in range(rounds):
+        relaxed = [
+            Vec2(
+                x=(.2 * relaxed[(index - 1) % len(relaxed)].x
+                   + .6 * point.x
+                   + .2 * relaxed[(index + 1) % len(relaxed)].x),
+                y=(.2 * relaxed[(index - 1) % len(relaxed)].y
+                   + .6 * point.y
+                   + .2 * relaxed[(index + 1) % len(relaxed)].y),
+            )
+            for index, point in enumerate(relaxed)
+        ]
+    return relaxed
 
 
 def _fit_drawn_points(points: list[Vec2], bounds: Rect, width: float, car_radius: float) -> list[Vec2]:

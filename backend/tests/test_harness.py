@@ -822,6 +822,11 @@ def test_npcs_pass_a_stopped_player_without_finish_line_oscillation(circuit: str
     for _ in range(500):
         world.step(Action(name=ActionName.IDLE))
         assert not world.terminated, world.reason
+        # Passing is sequenced: a compact field must not dispatch multiple cars
+        # toward the same shoulder while the first is still alongside.
+        assert sum(
+            opponent.overtake_phase == "passing" for opponent in world.opponents
+        ) <= 1
         for opponent in world.opponents:
             phases_seen[opponent.entity_id].add(opponent.overtake_phase)
             lane_changes[opponent.entity_id] = max(

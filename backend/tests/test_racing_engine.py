@@ -178,9 +178,10 @@ def test_npc_start_mode_defaults_to_starting_grid_and_can_be_distributed() -> No
     grid_scene = compile_racing_scene("grid", design(obstacles=0, npcs=3), seed=3)
     grid_world = RacingWorld.from_scene(grid_scene)
     assert grid_scene.npc_start_mode == "grid"
+    # The staggered grid gives every car its own longitudinal slot so launch
+    # paths never cross before the field has opened up.
     assert all(
-        abs((opponent.target_index - 1) % len(grid_scene.track_centerline)) <= 5
-        or opponent.target_index >= len(grid_scene.track_centerline) - 5
+        1 <= (grid_scene.start_line_index - opponent.target_index) % len(grid_scene.track_centerline) <= 9
         for opponent in grid_world.opponents
     )
     # The player holds pole, so every opponent lines up behind it in staggered
@@ -460,15 +461,14 @@ def test_first_npc_finisher_ends_the_race_as_a_loss() -> None:
     world = RacingWorld.from_scene(scene)
     world.countdown_ticks_remaining = 0
     opponent = world.opponents[0]
-    # Distance alone is deliberately insufficient: an NPC must pass through the
-    # same visible gate as the player. Put this car one sample before that gate
-    # so the next engine tick is a genuine finish-line crossing.
+    # Complete the sector sequence first, then put the NPC one sample before the
+    # finish gate so the next engine tick is a genuine winning crossing.
     before_finish = (scene.start_line_index - 1) % len(scene.track_centerline)
     opponent.position = scene.track_centerline[before_finish].model_copy()
     opponent.track_index = before_finish
     opponent.target_index = scene.start_line_index
     opponent.speed = 30.0
-    opponent.progress_samples = len(scene.track_centerline) * scene.laps
+    opponent.checkpoint_index = scene.sector_count - 1
 
     frame = world.step(Action())
 
@@ -478,6 +478,24 @@ def test_first_npc_finisher_ends_the_race_as_a_loss() -> None:
     assert world.reason == f"{opponent.entity_id} finished first"
     assert frame.events == [world.reason]
     assert frame.reward < 0
+
+
+def test_npc_cannot_finish_from_an_initial_start_line_crossing() -> None:
+    scene = compile_racing_scene("npc start crossing", design(obstacles=0, npcs=1), seed=11)
+    world = green_flag(RacingWorld.from_scene(scene))
+    opponent = world.opponents[0]
+    before_finish = (scene.start_line_index - 1) % len(scene.track_centerline)
+    opponent.position = scene.track_centerline[before_finish].model_copy()
+    opponent.track_index = before_finish
+    opponent.target_index = scene.start_line_index
+    opponent.speed = 30.0
+
+    world.step(Action())
+
+    assert opponent.checkpoint_index == 0
+    assert opponent.completed_laps == 0
+    assert opponent.finished_step is None
+    assert not world.terminated
 
 
 def test_npc_requires_each_physical_finish_gate_crossing_in_a_multilap_race() -> None:
@@ -493,6 +511,7 @@ def test_npc_requires_each_physical_finish_gate_crossing_in_a_multilap_race() ->
         opponent.track_index = before_finish
         opponent.target_index = scene.start_line_index
         opponent.speed = 30.0
+        opponent.checkpoint_index = scene.sector_count - 1
         world.step(Action())
 
     cross_finish()

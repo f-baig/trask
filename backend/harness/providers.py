@@ -1760,11 +1760,11 @@ compiler. The tool call carries the *decision to act*, nothing else.
 
 def chat_agent_reply(
     *, role: str, message: str, environment_context: dict | None = None,
-    history: list[dict] | None = None, max_tokens: int = 320,
+    history: list[dict] | None = None, max_tokens: int = 320, dimensions: str = "2d",
 ) -> tuple[str, ProviderUsage | None]:
     if not (os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")):
         return "The local racing coordinator is ready. Add OPENAI_API_KEY or ANTHROPIC_API_KEY to make this role model-backed.", None
-    system, prompt, model = _chat_agent_request(role, message, environment_context)
+    system, prompt, model = _chat_agent_request(role, message, environment_context, dimensions)
     if _is_openai_model(model):
         response, usage = openai_tool_turn(
             system=system, messages=[*(history or []), {"role": "user", "content": prompt}],
@@ -1777,7 +1777,7 @@ def chat_agent_reply(
 
 
 def _chat_agent_request(
-    role: str, message: str, environment_context: dict | None,
+    role: str, message: str, environment_context: dict | None, dimensions: str = "2d",
 ) -> tuple[str, str, str]:
     """The system prompt, user prompt, and model for one chat role."""
     if role == "main":
@@ -1790,9 +1790,21 @@ def _chat_agent_request(
         # gone — generation now reads the user's own words directly — so a structured dump
         # here is not a handoff to anything, it is just a wall of text where a sentence
         # would have done.
+        mode = "3D" if dimensions == "3d" else "2D"
+        mode_capability = (
+            "The person has selected 3D mode. Build a real 3D race: the certified circuit is "
+            "fitted with an elevation surface and is driven through the perspective runtime. "
+            "Hills, climbs, descents, banking, crests, and blind brows are supported. A request "
+            "that merely says '3D' is still a valid 3D build even if it does not name hills."
+            if dimensions == "3d" else
+            "The person has selected 2D mode. Build the flat top-down runtime; hills, banking, "
+            "crests, and elevation are unavailable in this mode."
+        )
         system = (
             "You are the RaceLab coordinator, talking with someone in a research harness for "
-            "generating 2D top-down racing circuits. You are "
+            "generating racing circuits in two game modes: 2D top-down and 3D perspective. "
+            f"The currently selected build mode is {mode}. {mode_capability}\n\n"
+            "You are "
             "yourself here, with your normal judgement, curiosity and range. The harness does "
             "not change who you are; it just means that when a circuit is genuinely wanted, you "
             "can actually make one.\n\n"
@@ -1996,7 +2008,7 @@ def anthropic_text_stream(
 def chat_agent_reply_stream(
     *, role: str, message: str | list[dict], environment_context: dict | None = None,
     history: list[dict] | None = None, max_tokens: int = 320,
-    tools: list[dict] | None = None,
+    tools: list[dict] | None = None, dimensions: str = "2d",
 ) -> Iterator[tuple[str, str]]:
     """The streaming twin of `chat_agent_reply`, sharing its system prompts by construction.
 
@@ -2007,10 +2019,10 @@ def chat_agent_reply_stream(
         yield ("text", "The local racing coordinator is ready. Add OPENAI_API_KEY or ANTHROPIC_API_KEY to make this role model-backed.")
         return
     if isinstance(message, list):
-        system, _unused, model = _chat_agent_request(role, "", environment_context)
+        system, _unused, model = _chat_agent_request(role, "", environment_context, dimensions)
         prompt: str | list[dict] = message
     else:
-        system, prompt, model = _chat_agent_request(role, message, environment_context)
+        system, prompt, model = _chat_agent_request(role, message, environment_context, dimensions)
     if _is_openai_model(model):
         response, usage = openai_tool_turn(
             system=system, messages=[*(history or []), {"role": "user", "content": prompt}],

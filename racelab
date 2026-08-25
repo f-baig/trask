@@ -24,7 +24,7 @@ Researcher workflow:
   ./racelab test            Run all backend and frontend checks
 
 Advanced/diagnostic commands:
-  ./racelab clean           Remove local installs and build caches; keep research data
+  ./racelab clean           Reset local harness data, installs, and build caches; keep .env
   ./racelab doctor          Check prerequisites and running services
   ./racelab play2d [flags]  Launch the native 2D game
   ./racelab play3d [flags]  Launch the native 3D game
@@ -70,14 +70,18 @@ clean_local() {
   if url_ready "$API_URL/health" || url_ready "$UI_URL"; then
     die "RaceLab is running. Stop it with Ctrl+C before cleaning."
   fi
-  say "removing local installs and build caches"
+  say "removing local harness data, installs, and build caches"
   rm -rf \
     "$VENV" \
     "$ROOT/node_modules" \
     "$ROOT/frontend/node_modules" \
     "$ROOT/frontend/dist" \
-    "$ROOT/.pytest_cache"
-  say "clean complete · .env and .harness-data were preserved"
+    "$ROOT/.pytest_cache" \
+    "$ROOT/.vite" \
+    "$ROOT/frontend/.vite" \
+    "$ROOT/.harness-data" \
+    "$ROOT/backend/.harness-data"
+  say "clean complete · local runs, environments, experiments, and caches were removed; .env was preserved"
 }
 
 configure_models() {

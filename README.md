@@ -37,7 +37,7 @@ Useful maintenance commands:
 ```bash
 ./racelab test       # backend tests plus frontend type/build checks
 ./racelab doctor     # check prerequisites and service health
-./racelab clean      # remove local installs/build caches; preserves .env and .harness-data
+./racelab clean      # reset local runs/environments/experiments, installs, and caches; preserves .env
 ```
 
 For a first-time setup without launching the browser, run `./racelab setup`.
@@ -53,6 +53,19 @@ For a video guide on how to use the platform, please click this [link](https://d
 | **Environments** | Check the compiled layout: top-down in 2D, orbitable preview in 3D. |
 | **Experiments** | Describe a comparison in natural language. The fixed predictive-skills player runs the requested conditions, seeds, and pace settings. |
 | **Runs** | Review outcome, ticks, calls, tokens, controllers, and trajectory. Click a path point to fork a continuation or correction. |
+
+### Experiment variables
+
+Each experiment keeps the predictive-skills player fixed and can vary these rollout inputs:
+
+| Variable | Available values |
+| --- | --- |
+| **Track condition** | Normal conditions, control delay, shifted obstacles, low grip, worn tires, heavy car, rear weight bias, high drag, or high downforce. |
+| **Seed** | One or more deterministic circuit variants compiled from the same brief. |
+| **Player aggression** | A value from 0 (cautious) to 1 (maximum attack), controlling how assertively the player carries pace. |
+| **Tick budget** | The maximum simulation ticks allowed before a rollout times out. |
+
+For example: “Compare seeds 11, 29, and 47 under low grip and high drag at 0.6 and 0.9 aggression, with a 1,200-tick budget.”
 
 ## Repository map
 

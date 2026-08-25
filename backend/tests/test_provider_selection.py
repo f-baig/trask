@@ -9,6 +9,40 @@ from harness.providers import ProviderUsage
 from harness.track_grammar import parse_track_prompt
 
 
+def test_coordinator_prompt_exposes_both_supported_game_modes() -> None:
+    """The chat must not describe the perspective runtime as an unavailable feature."""
+    system_3d, _, _ = providers._chat_agent_request(
+        "main", "make a hilly circuit", None, dimensions="3d",
+    )
+    system_2d, _, _ = providers._chat_agent_request(
+        "main", "make a flat circuit", None, dimensions="2d",
+    )
+
+    assert "two game modes: 2D top-down and 3D perspective" in system_3d
+    assert "currently selected build mode is 3D" in system_3d
+    assert "Build a real 3D race" in system_3d
+    assert "currently selected build mode is 2D" in system_2d
+
+
+def test_coordinator_forwards_the_selected_mode_to_its_chat(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The UI toggle is only useful if its mode reaches the chat system prompt."""
+    from harness import service as service_module
+    from harness.service import HarnessService
+    from harness.store import HarnessStore
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used")
+    received: list[str] = []
+    monkeypatch.setattr(
+        service_module, "chat_agent_reply_stream",
+        lambda **kwargs: (received.append(kwargs["dimensions"]) or iter([
+            ("text", "I can build that in the selected mode."),
+        ])),
+    )
+
+    HarnessService(store=HarnessStore(tmp_path)).dispatch_coordinator("hello", dimensions="3d")
+    assert received == ["3d"]
+
+
 @pytest.mark.parametrize(
     ("key_name", "provider", "expected_model", "stale_model"),
     [

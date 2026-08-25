@@ -48,6 +48,10 @@ NPC_NITRO_CLEARANCE = 90.0
 NPC_STRAIGHT_HEADING_DELTA = 8.0
 NPC_PASS_LANE_OFFSET = 44.0
 NPC_LANE_CHANGE_PER_TICK = 2.5
+# Only one car may claim a passing manoeuvre near the player at a time.  This
+# keeps a compact grid from sending two cars into the same shoulder of the
+# road, which was the source of the visible stop-and-go traffic jams.
+NPC_PASS_RESERVATION_STEPS = 18
 # A defending opponent may cover a rival's approach lane but never the certified
 # centerline: the deterministic racing-line oracle drives lane offset zero, so
 # blocking it would make aggressive-traffic scenes fail their own verification.
@@ -464,11 +468,12 @@ def _grid_start_slot(
         return (start_index + int(count * position / (total + 1))) % count, _npc_lane_offset(position)
     if position == 1:
         return (start_index - 2) % count, 0.0
-    # Row two onward is two-abreast.  All rows are behind the line, so no NPC can
-    # accidentally start halfway around the lap or cross the finish before racing.
-    row = (position - 2) // 2 + 2
+    # The grid is staggered: each competitor gets a longitudinal slot, while
+    # alternating sides of the corridor.  A two-abreast row made both cars aim
+    # at the next sharply-curved sample together; their straight-line waypoint
+    # chords could visibly cross before the collision guard engaged.
     lane = (-1.0 if position % 2 == 0 else 1.0) * min(30.0, track_width * .19)
-    return (start_index - row * 2) % count, lane
+    return (start_index - position * 2) % count, lane
 
 
 def _annotated_report(track: CompiledTrack, dynamics: DynamicsSpec):
@@ -689,7 +694,9 @@ class OpponentState:
     progress_samples: float = 0.0
     """Centerline samples travelled, which is this car's race distance."""
     completed_laps: int = 0
-    """Physical forward crossings of the shared finish gate."""
+    """Fully completed laps, each earned through the ordered gate sequence."""
+    checkpoint_index: int = 0
+    """The next sector gate this opponent must cross to progress its current lap."""
     finished_step: int | None = None
     lane_phase: float = 0.0
     """Fixed per-car phase for line wander, derived from the id rather than drawn."""
@@ -1029,6 +1036,7 @@ class RacingWorld:
                 "pass_clear_ticks": item.pass_clear_ticks,
                 "speed": item.speed, "nitro": item.nitro, "nitro_active": item.nitro_active,
                 "progress_samples": item.progress_samples, "completed_laps": item.completed_laps,
+                "checkpoint_index": item.checkpoint_index,
                 "finished_step": item.finished_step,
                 "lane_phase": item.lane_phase,
             } for item in self.opponents],
@@ -1135,6 +1143,7 @@ class RacingWorld:
                 nitro_active=item.nitro_active,
                 progress_samples=item.progress_samples,
                 completed_laps=item.completed_laps,
+                checkpoint_index=item.checkpoint_index,
                 finished_step=item.finished_step,
                 lane_phase=item.lane_phase,
             )
@@ -1181,12 +1190,15 @@ class RacingWorld:
                     "completed_laps",
                     self.scene.laps if opponent_finished_step is not None else 0,
                 ))
+                checkpoint_index = int(item.get("checkpoint_index", 0))
                 if opponent_progress < 0 or not math.isfinite(opponent_progress):
                     raise ValueError("Snapshot opponent progress must be finite and non-negative")
                 if opponent_finished_step is not None and opponent_finished_step < 0:
                     raise ValueError("Snapshot opponent finish step cannot be negative")
                 if not 0 <= completed_laps <= self.scene.laps:
                     raise ValueError("Snapshot opponent completed laps are outside the race range")
+                if not 0 <= checkpoint_index < self.scene.sector_count:
+                    raise ValueError("Snapshot opponent checkpoint index is outside the sector range")
                 if not all(math.isfinite(value) for value in (
                     position.x, position.y, lane_offset, base_lane_offset,
                     target_lane_offset, opponent_heading, opponent_speed, opponent_nitro,
@@ -1215,6 +1227,7 @@ class RacingWorld:
                     nitro_active=opponent_nitro_active,
                     progress_samples=opponent_progress,
                     completed_laps=completed_laps,
+                    checkpoint_index=checkpoint_index,
                     finished_step=opponent_finished_step,
                     lane_phase=float(item.get("lane_phase", _stable_phase(entity_id))),
                 ))
@@ -1373,7 +1386,13 @@ class RacingWorld:
         # resolved once per tick because `obstacle_shift` is a perturbation that
         # can move them between ticks but never within one.
         barriers = self._barrier_colliders()
-        finish_line = next(entity for entity in self.scene.entities if entity.id == "finish-line")
+        checkpoints = [
+            entity for entity in self.scene.entities if entity.kind == EntityKind.CHECKPOINT
+        ]
+        primary_passer_id = self._primary_passer(player_index)
+        # Scene compilation writes checkpoints in forward lap order: intermediate
+        # sectors first, then the shared start/finish gate. Opponents follow that
+        # exact sequence, so passing the start line from the grid cannot win a race.
         for opponent in self.opponents:
             behavior = opponent.behavior
             # Progress is advanced only through nearby forward samples. A global
@@ -1417,14 +1436,22 @@ class RacingWorld:
             clear_distance = 98.0 - 40.0 * behavior.aggression
             clear_ticks = max(2, round(9 - 6 * behavior.aggression))
             player_is_blocking = (
-                self.step_number > self.dynamics.control_hz * 5
+                # Let the field begin choosing clean lanes shortly after the
+                # green flag.  A five-second lockout meant a player could close
+                # the grid before an NPC had enough lateral travel to pass.
+                self.step_number > self.dynamics.control_hz
                 and 0 < steps_to_player <= trigger_steps
                 and player_distance < trigger_distance
                 and self.speed < target_speed * pace_threshold
+                # A passing lane is a shared piece of road, not a binary state
+                # every nearby opponent may enter on the same tick.  Give the
+                # nearest trailing car first refusal; following cars keep their
+                # normal line until that manoeuvre has cleared the player.
+                and opponent.entity_id == primary_passer_id
             )
             player_is_attacking = (
                 behavior.defends
-                and self.step_number > self.dynamics.control_hz * 5
+                and self.step_number > self.dynamics.control_hz
                 and -trigger_steps <= steps_to_player < -1
                 and player_distance < trigger_distance
                 and self.speed > opponent.speed * .92
@@ -1622,11 +1649,14 @@ class RacingWorld:
             advanced = (opponent.track_index - previous_index) % len(points)
             if advanced <= len(points) // 2:
                 opponent.progress_samples += advanced
-            crossed_finish = _crossed_checkpoint_gate(
-                self.scene, previous_position, opponent.position, finish_line, CAR_RADIUS,
-            )
-            if crossed_finish and opponent.completed_laps < self.scene.laps:
-                opponent.completed_laps += 1
+            expected_checkpoint = checkpoints[opponent.checkpoint_index]
+            if _crossed_checkpoint_gate(
+                self.scene, previous_position, opponent.position, expected_checkpoint, CAR_RADIUS,
+            ):
+                opponent.checkpoint_index += 1
+                if opponent.checkpoint_index == len(checkpoints):
+                    opponent.completed_laps += 1
+                    opponent.checkpoint_index = 0
             if opponent.finished_step is None and opponent.completed_laps >= self.scene.laps:
                 opponent.finished_step = self.step_number
                 if opponent.entity_id not in self.finish_order:
@@ -1731,20 +1761,85 @@ class RacingWorld:
     def _npc_passing_lane(
         self, opponent: OpponentState, player_lane_offset: float,
     ) -> float:
-        """Choose a deterministic side without cutting across a blocked car."""
+        """Choose a clear, unreserved side without cutting across a blocked car."""
         current_side = NPC_PASS_LANE_OFFSET if opponent.lane_offset >= 0 else -NPC_PASS_LANE_OFFSET
         opposite_side = -current_side
         safe_clearance = _npc_safe_gap(opponent.behavior)
-        if abs(current_side - player_lane_offset) >= safe_clearance:
-            return current_side
-        if abs(opposite_side - player_lane_offset) >= safe_clearance:
-            return opposite_side
+        candidates = (current_side, opposite_side)
+        for candidate in candidates:
+            if (
+                abs(candidate - player_lane_offset) >= safe_clearance
+                and not self._npc_lane_reserved(opponent, candidate)
+            ):
+                return candidate
         # This is only reachable if the player is almost sideways across the
-        # road; choose maximum clearance and let the follow-gap logic hold speed.
+        # road or the two pass lanes are reserved; choose maximum clearance and
+        # let the follow-gap logic hold speed until a lane opens.
         return max(
-            (current_side, opposite_side),
-            key=lambda candidate: abs(candidate - player_lane_offset),
+            candidates,
+            key=lambda candidate: (
+                not self._npc_lane_reserved(opponent, candidate),
+                abs(candidate - player_lane_offset),
+            ),
         )
+
+    def _primary_passer(self, player_index: int) -> str | None:
+        """Return the sole nearby car allowed to begin an overtake this tick.
+
+        Existing manoeuvres retain the reservation until they have moved clear.
+        That makes the choice stable while a compact field filters past a slow
+        player, instead of reshuffling it every control tick.
+        """
+        points = self.scene.track_centerline
+        contenders = [
+            opponent for opponent in self.opponents
+            if opponent.overtake_phase in {"passing", "merge"}
+            and math.hypot(
+                opponent.position.x - self.player.x,
+                opponent.position.y - self.player.y,
+            ) < 220.0
+        ]
+        if not contenders:
+            contenders = [
+                opponent for opponent in self.opponents
+                if opponent.overtake_phase == "cruise"
+                and 0 < _cyclic_index_delta(
+                    opponent.track_index, player_index, len(points),
+                ) <= NPC_PASS_RESERVATION_STEPS
+                and math.hypot(
+                    opponent.position.x - self.player.x,
+                    opponent.position.y - self.player.y,
+                ) < 220.0
+            ]
+        if not contenders:
+            return None
+        return min(
+            contenders,
+            key=lambda opponent: (
+                _cyclic_index_delta(opponent.track_index, player_index, len(points))
+                if _cyclic_index_delta(opponent.track_index, player_index, len(points)) > 0
+                else len(points),
+                round(math.hypot(
+                    opponent.position.x - self.player.x,
+                    opponent.position.y - self.player.y,
+                ), 4),
+                opponent.entity_id,
+            ),
+        ).entity_id
+
+    def _npc_lane_reserved(self, opponent: OpponentState, candidate: float) -> bool:
+        """Whether another local pass is already committed to this lane."""
+        points = self.scene.track_centerline
+        for other in self.opponents:
+            if other.entity_id == opponent.entity_id or other.overtake_phase not in {"passing", "merge"}:
+                continue
+            forward = _cyclic_index_delta(opponent.track_index, other.track_index, len(points))
+            reverse = _cyclic_index_delta(other.track_index, opponent.track_index, len(points))
+            if min(forward, reverse) > NPC_PASS_RESERVATION_STEPS:
+                continue
+            if abs(other.target_lane_offset - candidate) < NPC_CONTACT_CLEARANCE:
+                return True
+        return False
 
     def _npc_on_straight(self, index: int, anticipation: int = 4) -> bool:
         """Whether the road is straight, looking `anticipation` samples further on.
@@ -1851,9 +1946,10 @@ class RacingWorld:
         to move and stay welded together for the rest of the race. Excluding them
         lets the pair separate, which is the only outcome that resolves it.
 
-        The player is deliberately not part of this test. Player contact is an
-        authoritative terminating collision, and quietly holding an opponent short
-        of the player would erase it.
+        The player is also treated as solid for an opponent's planned motion.
+        Player contact remains authoritative when the player drives into an NPC,
+        but an NPC should not manufacture a collision by continuing to steer into
+        the player after its lane-change decision is no longer safe.
         """
         others = [
             other for other in self.opponents
@@ -1862,6 +1958,9 @@ class RacingWorld:
                 other.position.x - start.x, other.position.y - start.y,
             ) >= NPC_CONTACT_CLEARANCE
         ]
+        player_is_separate = math.hypot(
+            self.player.x - start.x, self.player.y - start.y,
+        ) >= NPC_CONTACT_CLEARANCE
         path_start, path_end = (start.x, start.y), (proposed.x, proposed.y)
         barrier_contacts = [
             (collider, contact)
@@ -1888,6 +1987,11 @@ class RacingWorld:
                     rebound.x, rebound.y, CAR_RADIUS,
                 )
                 for other in others
+            ) and (
+                not player_is_separate
+                or not circle_collider(self.player.x, self.player.y, CAR_RADIUS).hits_circle(
+                    rebound.x, rebound.y, CAR_RADIUS,
+                )
             ):
                 return rebound
             return start
@@ -1899,12 +2003,19 @@ class RacingWorld:
                 for collider in barriers
             ):
                 return False
-            return not any(
+            clear_of_opponents = not any(
                 circle_collider(
                     other.position.x, other.position.y, CAR_RADIUS,
                 ).hits_swept_circle(path_start, path_end, CAR_RADIUS)
                 for other in others
             )
+            clear_of_player = (
+                not player_is_separate
+                or not circle_collider(
+                    self.player.x, self.player.y, CAR_RADIUS,
+                ).hits_swept_circle(path_start, path_end, CAR_RADIUS)
+            )
+            return clear_of_opponents and clear_of_player
 
         if clear(proposed):
             return proposed
@@ -2605,12 +2716,7 @@ def racing_strategy_context(scene: SceneSpec) -> dict:
 
 
 def _npc_lane_offset(number: int) -> float:
-    """Alternating grid lane for one car, by its position in the field.
-
-    The period has to match the two-cars-per-row grid. A three-long cycle put the
-    third and fourth cars in the same row *and* the same lane, so they spawned at
-    identical coordinates and drove the whole race welded together.
-    """
+    """Deterministic alternating lane for distributed starts and grid slots."""
     return 34.0 if number % 2 else -34.0
 
 

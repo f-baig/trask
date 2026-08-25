@@ -81,7 +81,7 @@ def test_npc_win_terminates_an_elevated_race_too() -> None:
     opponent.track_index = before_finish
     opponent.target_index = world.scene.start_line_index
     opponent.speed = 30.0
-    opponent.progress_samples = len(world.scene.track_centerline) * world.scene.laps
+    opponent.checkpoint_index = world.scene.sector_count - 1
     frame = world.step(Action())
     assert world.terminated and not world.succeeded
     assert frame.events == [f"{opponent.entity_id} finished first"]
