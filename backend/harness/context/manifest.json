@@ -1,0 +1,46 @@
+{
+  "version": 2,
+  "packs": {
+    "environment": [
+      "contracts/game-rules.md",
+      "agents/environment-agent.md",
+      "contracts/environment-output.md",
+      "environment/capabilities/track-grammar.md"
+    ],
+    "environment-faithful": [
+      "contracts/game-rules.md",
+      "agents/environment-agent.md",
+      "contracts/environment-output.md",
+      "environment/capabilities/track-grammar.md",
+      "environment/stages/requirement-ledger.md"
+    ],
+    "player-2d": [
+      "contracts/game-rules.md",
+      "agents/player-agent.md",
+      "contracts/player-observation.md",
+      "contracts/no-telemetry.md",
+      "player/timing/realtime-overlap.md",
+      "player/skills/follow-lane.md",
+      "player/skills/prepare-turn.md",
+      "player/skills/take-turn.md",
+      "player/skills/take-hairpin.md",
+      "player/skills/recover-track.md",
+      "player/skills/stabilize.md",
+      "player/views/cone-2d.md"
+    ],
+    "player-3d": [
+      "contracts/game-rules.md",
+      "agents/player-agent.md",
+      "contracts/player-observation.md",
+      "contracts/no-telemetry.md",
+      "player/timing/realtime-overlap.md",
+      "player/skills/follow-lane.md",
+      "player/skills/prepare-turn.md",
+      "player/skills/take-turn.md",
+      "player/skills/take-hairpin.md",
+      "player/skills/recover-track.md",
+      "player/skills/stabilize.md",
+      "player/views/camera-3d.md"
+    ]
+  }
+}

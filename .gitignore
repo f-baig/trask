@@ -1,0 +1,9 @@
+.venv/
+node_modules/
+dist/
+.harness-data/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+

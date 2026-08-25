@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# One entrypoint for setting up, serving, testing, and playing RaceLab.
+
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$ROOT/.venv"
+READY_FILE="$VENV/.racelab-ready"
+UI_URL="http://127.0.0.1:5173"
+API_URL="http://127.0.0.1:8000"
+
+cd "$ROOT"
+
+say() { printf '\nRaceLab · %s\n' "$*"; }
+die() { printf '\nRaceLab error · %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+RaceLab researcher launcher
+
+Researcher workflow:
+  ./racelab                 Install if needed, start everything, open the UI
+  ./racelab configure       Choose OpenAI or Anthropic and securely save its API key
+  ./racelab test            Run all backend and frontend checks
+
+Advanced/diagnostic commands:
+  ./racelab clean           Remove local installs and build caches; keep research data
+  ./racelab doctor          Check prerequisites and running services
+  ./racelab play2d [flags]  Launch the native 2D game
+  ./racelab play3d [flags]  Launch the native 3D game
+  ./racelab engine-check    Run the deterministic engine conformance matrix
+  ./racelab start --no-open Start without opening a browser
+
+Ctrl+C stops both servers started by `./racelab start`.
+Model-backed agents are optional; offline tracks and reference drivers work
+without a key. Run `./racelab configure` once when model access is wanted.
+EOF
+}
+
+require_prerequisites() {
+  command -v python3 >/dev/null 2>&1 || die "Python 3.12+ is required."
+  command -v node >/dev/null 2>&1 || die "Node.js is required (Node 20+ recommended)."
+  command -v npm >/dev/null 2>&1 || die "npm is required."
+  command -v curl >/dev/null 2>&1 || die "curl is required for service health checks."
+
+  python3 - <<'PY' || die "Python 3.12+ is required."
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 12) else 1)
+PY
+}
+
+dependency_fingerprint() {
+  cksum pyproject.toml package-lock.json | cksum | awk '{print $1 ":" $2}'
+}
+
+install_dependencies() {
+  require_prerequisites
+  say "installing dependencies"
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    python3 -m venv "$VENV"
+  fi
+  "$VENV/bin/pip" install -e '.[dev,native]'
+  npm install
+  dependency_fingerprint > "$READY_FILE"
+  say "setup complete"
+}
+
+clean_local() {
+  [[ $# -eq 0 ]] || die "clean takes no arguments"
+  if url_ready "$API_URL/health" || url_ready "$UI_URL"; then
+    die "RaceLab is running. Stop it with Ctrl+C before cleaning."
+  fi
+  say "removing local installs and build caches"
+  rm -rf \
+    "$VENV" \
+    "$ROOT/node_modules" \
+    "$ROOT/frontend/node_modules" \
+    "$ROOT/frontend/dist" \
+    "$ROOT/.pytest_cache"
+  say "clean complete · .env and .harness-data were preserved"
+}
+
+configure_models() {
+  require_prerequisites
+  local config_file="${RACELAB_CONFIG_FILE:-$ROOT/.env}"
+  [[ -f "$config_file" ]] || cp "$ROOT/.env.example" "$config_file"
+  [[ -t 0 ]] || die "configure needs an interactive terminal."
+
+  printf '\nChoose a model provider:\n  1) OpenAI\n  2) Anthropic\n\nProvider [1]: '
+  local provider_choice provider api_variable default_model account_url
+  IFS= read -r provider_choice
+  case "${provider_choice:-1}" in
+    1|openai|OpenAI)
+      provider="OpenAI"
+      api_variable="OPENAI_API_KEY"
+      default_model="gpt-5.6-luna"
+      account_url="https://platform.openai.com/api-keys"
+      ;;
+    2|anthropic|Anthropic)
+      provider="Anthropic"
+      api_variable="ANTHROPIC_API_KEY"
+      default_model="claude-sonnet-5"
+      account_url="https://console.anthropic.com/settings/keys"
+      ;;
+    *) die "choose 1 for OpenAI or 2 for Anthropic." ;;
+  esac
+
+  local has_existing=0 auth_default=1
+  if grep -Eq "^${api_variable}=.+$" "$config_file"; then
+    has_existing=1
+    auth_default=3
+  fi
+  printf '\n%s authentication:\n  1) Paste an API key\n  2) Sign in / create a key in your browser\n' "$provider"
+  (( has_existing )) && printf '  3) Keep the existing key\n'
+  printf '\nChoice [%s]: ' "$auth_default"
+  local auth_choice
+  IFS= read -r auth_choice
+  auth_choice="${auth_choice:-$auth_default}"
+
+  local api_key=""
+  case "$auth_choice" in
+    1) ;;
+    2)
+      if command -v open >/dev/null 2>&1; then
+        open "$account_url" >/dev/null 2>&1 || true
+      elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$account_url" >/dev/null 2>&1 &
+      else
+        printf 'Open this page: %s\n' "$account_url"
+      fi
+      printf 'After signing in, create an API key and return here.\n'
+      ;;
+    3)
+      (( has_existing )) || die "there is no existing ${provider} key to keep."
+      ;;
+    *) die "choose 1, 2, or 3." ;;
+  esac
+
+  if [[ "$auth_choice" != "3" ]]; then
+    printf '%s API key (hidden): ' "$provider"
+    IFS= read -r -s api_key
+    printf '\n'
+    [[ -n "$api_key" ]] || die "no API key was entered."
+  fi
+
+  python3 - "$config_file" "$api_variable" "$default_model" "$auth_choice" 3<<<"$api_key" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+path = Path(sys.argv[1])
+api_variable = sys.argv[2]
+model = sys.argv[3]
+keep_existing = sys.argv[4] == "3"
+entered_key = os.fdopen(3).read().strip()
+lines = path.read_text().splitlines()
+existing_key = next((
+    line.split("=", 1)[1] for line in lines
+    if line.startswith(f"{api_variable}=") and line.split("=", 1)[1]
+), "")
+key = existing_key if keep_existing else entered_key
+if not key:
+    raise SystemExit(f"No value is configured for {api_variable}")
+
+# Keep exactly one active provider. Switching remains deterministic without
+# introducing a credential store or provider-selection layer into the harness.
+managed = ("OPENAI_API_KEY=", "ANTHROPIC_API_KEY=", "RACING_MODEL=")
+output = [
+    line for line in lines
+    if not any(line.startswith(prefix) for prefix in managed)
+]
+output.extend((f"{api_variable}={key}", f"RACING_MODEL={model}"))
+path.write_text("\n".join(output).rstrip() + "\n")
+PY
+  unset api_key
+  chmod 600 "$config_file"
+  say "$provider model access configured; run ./racelab"
+}
+
+has_model_configuration() {
+  local config_file="${RACELAB_CONFIG_FILE:-$ROOT/.env}"
+  [[ -f "$config_file" ]] && grep -Eq '^(OPENAI_API_KEY|ANTHROPIC_API_KEY)=.+$' "$config_file"
+}
+
+offer_model_configuration() {
+  has_model_configuration && return 0
+  [[ -t 0 ]] || return 0
+  printf '\nNo model provider is configured. Configure OpenAI or Anthropic now? [Y/n] '
+  local answer
+  IFS= read -r answer
+  case "${answer:-y}" in
+    y|Y|yes|YES) configure_models ;;
+    *) say "continuing in offline mode; run ./racelab configure later" ;;
+  esac
+}
+
+ensure_setup() {
+  require_prerequisites
+  local expected current=""
+  expected="$(dependency_fingerprint)"
+  [[ -f "$READY_FILE" ]] && current="$(<"$READY_FILE")"
+  if [[ ! -x "$VENV/bin/harness" || ! -d node_modules || "$current" != "$expected" ]]; then
+    say "first run or dependency change detected"
+    install_dependencies
+  fi
+}
+
+url_ready() {
+  curl --silent --fail --max-time 1 "$1" >/dev/null 2>&1
+}
+
+port_open() {
+  "$VENV/bin/python" - "$1" <<'PY'
+import socket, sys
+sock = socket.socket()
+sock.settimeout(.25)
+try:
+    open_ = sock.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0
+finally:
+    sock.close()
+raise SystemExit(0 if open_ else 1)
+PY
+}
+
+wait_for_url() {
+  local label="$1" url="$2" pid="$3" attempts=0
+  while (( attempts < 120 )); do
+    url_ready "$url" && return 0
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+    sleep .25
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+open_ui() {
+  if command -v open >/dev/null 2>&1; then
+    open "$UI_URL" >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$UI_URL" >/dev/null 2>&1 &
+  fi
+  return 0
+}
+
+start_services() {
+  ensure_setup
+  offer_model_configuration
+  local should_open=1
+  [[ $# -le 1 ]] || die "start accepts only --no-open"
+  if [[ $# -eq 1 ]]; then
+    [[ "$1" == "--no-open" ]] || die "start accepts only --no-open"
+    should_open=0
+  fi
+
+  if url_ready "$API_URL/health" && url_ready "$UI_URL"; then
+    say "already running at $UI_URL"
+    (( should_open )) && open_ui
+    return 0
+  fi
+  port_open 8000 && die "port 8000 is already in use by another process."
+  port_open 5173 && die "port 5173 is already in use by another process."
+
+  local -a api_args
+  api_args=("$VENV/bin/uvicorn" harness.api:app --app-dir backend --port 8000)
+  [[ -f .env ]] && api_args+=(--env-file .env)
+
+  say "starting API and UI"
+  "${api_args[@]}" &
+  local api_pid=$!
+  npm run dev -- --clearScreen false &
+  local ui_pid=$!
+
+  cleanup() {
+    trap - EXIT INT TERM
+    kill "$api_pid" "$ui_pid" >/dev/null 2>&1 || true
+    wait "$api_pid" "$ui_pid" >/dev/null 2>&1 || true
+  }
+  trap cleanup EXIT INT TERM
+
+  wait_for_url "API" "$API_URL/health" "$api_pid" || die "API failed to start."
+  wait_for_url "UI" "$UI_URL" "$ui_pid" || die "UI failed to start."
+  say "ready · $UI_URL"
+  printf 'Press Ctrl+C to stop RaceLab.\n\n'
+  (( should_open )) && open_ui
+
+  while kill -0 "$api_pid" >/dev/null 2>&1 && kill -0 "$ui_pid" >/dev/null 2>&1; do
+    sleep 1
+  done
+  die "one of the RaceLab services stopped unexpectedly."
+}
+
+doctor() {
+  require_prerequisites
+  say "doctor"
+  printf 'Python: %s\n' "$(python3 --version 2>&1)"
+  printf 'Node:   %s\n' "$(node --version)"
+  printf 'npm:    %s\n' "$(npm --version)"
+  printf 'Python environment: %s\n' "$([[ -x "$VENV/bin/harness" ]] && echo ready || echo missing)"
+  printf 'Node dependencies:  %s\n' "$([[ -d node_modules ]] && echo ready || echo missing)"
+  printf 'API:                %s\n' "$(url_ready "$API_URL/health" && echo running || echo stopped)"
+  printf 'UI:                 %s\n' "$(url_ready "$UI_URL" && echo running || echo stopped)"
+  [[ -f .env ]] && printf 'Model configuration: .env present\n' || printf 'Model configuration: offline mode (.env is optional)\n'
+}
+
+command_name="${1:-start}"
+[[ $# -gt 0 ]] && shift
+case "$command_name" in
+  start) start_services "$@" ;;
+  configure) [[ $# -eq 0 ]] || die "configure takes no arguments"; configure_models ;;
+  clean) clean_local "$@" ;;
+  setup) [[ $# -eq 0 ]] || die "setup takes no arguments"; install_dependencies ;;
+  doctor) [[ $# -eq 0 ]] || die "doctor takes no arguments"; doctor ;;
+  play2d) ensure_setup; exec "$VENV/bin/harness" play "$@" ;;
+  play3d) ensure_setup; exec "$VENV/bin/harness" play3d "$@" ;;
+  test)
+    [[ $# -eq 0 ]] || die "test takes no arguments"
+    ensure_setup
+    "$VENV/bin/pytest" -q backend/tests
+    npm run build
+    ;;
+  engine-check) ensure_setup; exec "$VENV/bin/harness" engine-check "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; die "unknown command: $command_name" ;;
+esac

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "racelab-harness"
+version = "0.1.0"
+description = "A deterministic 2D racing-agent generation and evaluation harness"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic>=2.9,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+native = [
+  "pygame-ce>=2.5,<3",
+  # The optical-flow overlay solves Lucas-Kanade over whole frames. OpenCV is
+  # deliberately not used: its wheels vendor their own SDL2, which collides with
+  # the pygame-ce SDL2 every rendered frame in this harness goes through.
+  "numpy>=1.26,<3",
+]
+dev = [
+  "httpx>=0.27,<1",
+  "matplotlib>=3.9,<4",
+  "pytest>=8.3,<9",
+]
+
+[project.scripts]
+harness = "harness.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
