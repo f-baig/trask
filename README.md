@@ -11,6 +11,8 @@ The normal player is always the predictive-skills agent:
 
 It does not receive a map, centerline, checkpoint state, route progress, or simulator telemetry. The harness supplies reusable controller skills and runs their model calls alongside tick-rate control.
 
+This project was coauthored with Codex, even though it isn't in the contributor list.
+
 ## Setup
 
 ### Prerequisites
